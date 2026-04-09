@@ -690,7 +690,7 @@ def _exp_margin(margin):
 class AbstractFlatnessLossFunction(AbstractLossFunction):
     """Base class for FlatnessLosses"""
 
-    def __init__(self, uniform_features, uniform_label, power=2.0, fl_coefficient=3.0, allow_wrong_signs=True):
+    def __init__(self, uniform_features, uniform_label, power=2.0, fl_coefficient=3.0, allow_wrong_signs=True, roi_range=None):
         self.uniform_features = uniform_features
         if isinstance(uniform_label, numbers.Number):
             self.uniform_label = numpy.array([uniform_label])
@@ -699,6 +699,9 @@ class AbstractFlatnessLossFunction(AbstractLossFunction):
         self.power = power
         self.fl_coefficient = fl_coefficient
         self.allow_wrong_signs = allow_wrong_signs
+        # ROI (Region of Interest) for applying flatness loss gradient
+        # If None, apply to all events. If specified as (min, max), only apply to events in this range.
+        self.roi_range = roi_range
 
     def fit(self, X, y, sample_weight=None):
         sample_weight = check_sample_weight(y, sample_weight=sample_weight, normalize=True, normalize_by_class=True)
@@ -710,6 +713,10 @@ class AbstractFlatnessLossFunction(AbstractLossFunction):
         self.group_matrices = {}
         self.group_weights = {}
         self.label_masks = {}
+
+        # Store uniform feature values for ROI gradient masking
+        # This allows us to access the actual feature values during gradient computation
+        self.uniform_features_values = X[self.uniform_features].values if self.uniform_features else None
 
         occurences = numpy.zeros(len(X))
         for label in self.uniform_label:
@@ -758,6 +765,18 @@ class AbstractFlatnessLossFunction(AbstractLossFunction):
                     * numpy.sign(local_pos - global_pos)
                     * numpy.abs(local_pos - global_pos) ** (self.power - 1)
                 )
+
+                # ROI Gradient Masking: Apply flatness loss only within specified range
+                if self.roi_range is not None and self.uniform_features_values is not None:
+                    roi_min, roi_max = self.roi_range
+                    # Get the uniform feature values (e.g., myy) for events in this bin
+                    # Assuming single uniform feature for now
+                    uniform_vals = self.uniform_features_values[indices_in_bin, 0]
+                    # Create mask: True if within ROI, False otherwise
+                    roi_mask = (uniform_vals >= roi_min) & (uniform_vals <= roi_max)
+                    # Apply mask: zero out gradients for events outside ROI
+                    bin_gradient = bin_gradient * roi_mask
+
                 neg_gradient[indices_in_bin] += bin_gradient
 
         neg_gradient *= self.divided_weight
@@ -786,7 +805,7 @@ class AbstractFlatnessLossFunction(AbstractLossFunction):
 
 class BinFlatnessLossFunction(AbstractFlatnessLossFunction):
     def __init__(
-        self, uniform_features, uniform_label, n_bins=10, power=2.0, fl_coefficient=3.0, allow_wrong_signs=True
+        self, uniform_features, uniform_label, n_bins=10, power=2.0, fl_coefficient=3.0, allow_wrong_signs=True, roi_range=None
     ):
         r"""
         This loss function contains separately penalty for non-flatness and for bad prediction quality.
@@ -803,6 +822,7 @@ class BinFlatnessLossFunction(AbstractFlatnessLossFunction):
         :param float fl_coefficient: multiplier for flatness_loss. Controls the tradeoff of quality vs uniformity.
         :param bool allow_wrong_signs: defines whether gradient may different sign from the "sign of class"
             (i.e. may have negative gradient on signal). If False, values will be clipped to zero.
+        :param tuple|None roi_range: (min, max) range for applying flatness loss. If None, apply to all events.
 
         .. [FL] A. Rogozhnikov et al, New approaches for boosting to uniformity
             http://arxiv.org/abs/1410.4140
@@ -815,6 +835,7 @@ class BinFlatnessLossFunction(AbstractFlatnessLossFunction):
             power=power,
             fl_coefficient=fl_coefficient,
             allow_wrong_signs=allow_wrong_signs,
+            roi_range=roi_range,
         )
 
     def _compute_groups_indices(self, X, y, label):
@@ -845,6 +866,7 @@ class KnnFlatnessLossFunction(AbstractFlatnessLossFunction):
         max_groups=5000,
         allow_wrong_signs=True,
         random_state=42,
+        roi_range=None,
     ):
         r"""
         This loss function contains separately penalty for non-flatness and for bad prediction quality.
@@ -863,6 +885,7 @@ class KnnFlatnessLossFunction(AbstractFlatnessLossFunction):
             (i.e. may have negative gradient on signal). If False, values will be clipped to zero.
         :param int max_groups: to limit memory consumption when training sample is large,
             we randomly pick this number of points with their members.
+        :param tuple|None roi_range: (min, max) range for applying flatness loss. If None, apply to all events.
 
         .. [FL] A. Rogozhnikov et al, New approaches for boosting to uniformity
             http://arxiv.org/abs/1410.4140
@@ -878,6 +901,7 @@ class KnnFlatnessLossFunction(AbstractFlatnessLossFunction):
             power=power,
             fl_coefficient=fl_coefficient,
             allow_wrong_signs=allow_wrong_signs,
+            roi_range=roi_range,
         )
 
     def _compute_groups_indices(self, X, y, label):
