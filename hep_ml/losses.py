@@ -917,4 +917,149 @@ class KnnFlatnessLossFunction(AbstractFlatnessLossFunction):
             return knn_indices
 
 
+class EqualFreqBinFlatnessLossFunction(AbstractFlatnessLossFunction):
+    def __init__(
+        self,
+        uniform_features,
+        uniform_label,
+        n_bins=10,
+        min_sample_per_bin=300,
+        power=2.0,
+        fl_coefficient=3.0,
+        allow_wrong_signs=True,
+        roi_range=None,
+    ):
+        r"""
+        This loss function contains separately penalty for non-flatness and for bad prediction quality.
+
+        :math:`\text{loss} = \text{ExpLoss} + c \times \text{FlatnessLoss}`
+
+        FlatnessLoss computed using **equal-frequency binning** with dynamic merging.
+        Bins are determined by unweighted sample counts (not feature value ranges),
+        ensuring each bin has at least `min_sample_per_bin` events.
+
+        :param list[str] uniform_features: names of features, along which we want to obtain uniformity of predictions
+        :param int|list[int] uniform_label: the label(s) of classes for which uniformity is desired
+        :param int n_bins: target number of bins along each variable
+        :param int min_sample_per_bin: minimum **unweighted** events per bin (enforced after merging)
+        :param float power: the loss contains the difference :math:`| F - F_bin |^p`, where p is power
+        :param float fl_coefficient: multiplier for flatness_loss. Controls the tradeoff of quality vs uniformity.
+        :param bool allow_wrong_signs: defines whether gradient may different sign from the "sign of class"
+            (i.e. may have negative gradient on signal). If False, values will be clipped to zero.
+        :param tuple|None roi_range: (min, max) range for applying flatness loss. If specified, samples
+            outside this range are excluded from binning (gradient=0 for those samples).
+
+        .. [FL] A. Rogozhnikov et al, New approaches for boosting to uniformity
+            http://arxiv.org/abs/1410.4140
+        """
+        self.n_bins = n_bins
+        self.min_sample_per_bin = min_sample_per_bin
+        AbstractFlatnessLossFunction.__init__(
+            self,
+            uniform_features,
+            uniform_label=uniform_label,
+            power=power,
+            fl_coefficient=fl_coefficient,
+            allow_wrong_signs=allow_wrong_signs,
+            roi_range=roi_range,
+        )
+
+    def _compute_groups_indices(self, X, y, label):
+        """
+        Returns List[List[int]] - each inner list contains event indices for one bin.
+        Uses equal-frequency binning with dynamic merging to ensure min_sample_per_bin.
+
+        Binning is determined by **unweighted counts**, but gradient computation uses sample_weight.
+        """
+        # Step 0: ROI Pre-filtering (CRITICAL - must be done BEFORE binning)
+        label_mask = y == label
+
+        if self.roi_range is not None and self.uniform_features:
+            roi_min, roi_max = self.roi_range
+            primary_feature = self.uniform_features[0]
+            feature_values = X[primary_feature].values
+            roi_mask = (feature_values >= roi_min) & (feature_values <= roi_max)
+            label_mask = label_mask & roi_mask
+
+        label_indices = numpy.where(label_mask)[0]
+        n_samples = len(label_indices)
+
+        # Edge case: too few samples - return single group
+        if n_samples < self.min_sample_per_bin:
+            return [label_indices]
+
+        # Sort by primary uniform feature
+        primary_feature = self.uniform_features[0]
+        X_label = X.loc[label_mask, self.uniform_features]
+        sorted_order = numpy.argsort(X_label[primary_feature].values)
+        sorted_indices = label_indices[sorted_order]
+
+        # Create two shifted grids
+        groups_shift_0 = self._create_equal_freq_bins(sorted_indices, n_samples, shift=0)
+        groups_shift_1 = self._create_equal_freq_bins(sorted_indices, n_samples, shift=1)
+
+        # Return flat List[List[int]] for base class compatibility
+        return groups_shift_0 + groups_shift_1
+
+    def _create_equal_freq_bins(self, sorted_indices, n_samples, shift):
+        """Create bins with dynamic merging to enforce min_sample_per_bin."""
+        # Generate bin edges using numpy.linspace for robustness
+        if shift == 0:
+            # Standard equal-frequency binning
+            bin_edges = numpy.linspace(0, n_samples, self.n_bins + 1).astype(int)
+        else:
+            # Shift=1: Generate interleaved grid at midpoints of Shift 0 boundaries
+            # This creates bins that are offset from Shift 0 by half a bin width
+            shift0_edges = numpy.linspace(0, n_samples, self.n_bins + 1)
+            # Midpoints between Shift 0 edges
+            mid_edges = (shift0_edges[:-1] + shift0_edges[1:]) / 2
+            # CRITICAL: Manually insert 0 at start and n_samples at end to cover full range
+            bin_edges = numpy.concatenate([[0], mid_edges, [n_samples]])
+            bin_edges = numpy.unique(bin_edges).astype(int)
+
+        # Ensure boundaries are exactly [0, n_samples]
+        bin_edges[0] = 0
+        bin_edges[-1] = n_samples
+
+        # Create initial bins
+        bins = []
+        for i in range(len(bin_edges) - 1):
+            start, end = bin_edges[i], bin_edges[i + 1]
+            if start < end:
+                bins.append(sorted_indices[start:end])
+
+        # Apply dynamic merging until all bins satisfy min_sample_per_bin
+        bins = self._merge_small_bins(bins, self.min_sample_per_bin)
+
+        return bins
+
+    def _merge_small_bins(self, bins, min_size):
+        """
+        Merge bins using "look-ahead" strategy.
+        Continues merging until ALL bins have count >= min_size.
+        """
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(bins):
+                current_size = len(bins[i])
+
+                if current_size < min_size:
+                    # Always merge with NEXT bin (look-ahead strategy)
+                    if i == len(bins) - 1:
+                        # Last bin - merge with previous
+                        bins[i - 1] = numpy.concatenate([bins[i - 1], bins[i]])
+                        bins.pop(i)
+                    else:
+                        # Merge current with next
+                        bins[i] = numpy.concatenate([bins[i], bins[i + 1]])
+                        bins.pop(i + 1)
+                    changed = True
+                    break  # Restart check after merge
+                i += 1
+
+        return bins
+
+
 # endregion

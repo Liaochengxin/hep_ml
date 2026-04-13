@@ -11,6 +11,8 @@ import numpy
 import pandas
 import sklearn.model_selection as sklearn_cross_validation
 from scipy.special import expit
+import warnings
+warnings.filterwarnings("ignore", message="X has feature names, but NearestNeighbors was fitted without feature names")
 from sklearn.neighbors import NearestNeighbors
 
 __author__ = "Alex Rogozhnikov"

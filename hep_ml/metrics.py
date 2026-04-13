@@ -46,6 +46,8 @@ Don't forget to scale features is those are of different nature.
 """
 
 import numpy
+import warnings
+warnings.filterwarnings("ignore", message="X has feature names, but NearestNeighbors was fitted without feature names")
 from sklearn.base import BaseEstimator
 from sklearn.neighbors import NearestNeighbors
 
